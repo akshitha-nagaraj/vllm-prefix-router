@@ -12,6 +12,12 @@ policy=$1
 name=$2
 shift 2
 
+# Keep the Mac from idle-sleeping while this script runs; a sleep mid-run stalls
+# the cluster and corrupts the latency measurements.
+if command -v caffeinate >/dev/null; then
+  caffeinate -i -w $$ &
+fi
+
 # Restart the router so every run starts with an empty routing table.
 kubectl set env deployment/router POLICY="$policy" >/dev/null
 kubectl rollout restart deployment/router >/dev/null

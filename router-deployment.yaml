@@ -6,6 +6,10 @@ metadata:
   name: router
 spec:
   replicas: 1
+  # Stop the old pod before starting the new one: the vLLM pods reserve most of
+  # the node's CPU, so a second router pod often can't be scheduled alongside.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: router
