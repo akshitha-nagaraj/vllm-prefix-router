@@ -2,8 +2,6 @@
 
 Prefix-cache-aware request routing for multi-replica vLLM on Kubernetes.
 
-> **Status:** in progress. The cluster and vLLM deployment work; the router and benchmarks are being built.
-
 ## The problem
 
 vLLM caches the KV state of prompt prefixes it has already processed (automatic prefix caching). When a new request shares a prefix with an earlier one, such as the same system prompt or an earlier turn of the same conversation, vLLM skips recomputing it. On a single replica this is a large win. In a quick test on this setup, a ~2.3k-token prompt took 12.4s cold and 0.32s when its prefix was cached.
@@ -31,6 +29,41 @@ All three policies run inside the same router, so measured differences come from
 - Where does pure cache affinity start to hurt because of load imbalance?
 - How should the hybrid threshold be set, and does it depend on the workload?
 - How do the gains change with the number of replicas and with cache pressure?
+
+## Results
+
+**When the set of distinct system prompts is larger than one replica's cache, cache-aware routing serves 13–16 percentage points more prompt tokens from cache than round-robin, and cuts median time to first token by 33–42%.** When every prompt fits in each replica's cache, the policies perform about the same.
+
+The workload is multi-turn chat on 2 replicas: about 0.8 new sessions per second for 2 minutes, 3 turns per session, and a ~420-token system prompt drawn from N distinct prompts. Each configuration was run 3 times. Lines show the mean, and the faint dots show the individual runs.
+
+![Prefix cache hit rate](results/figures/final-hit-rate.png)
+
+![Median time to first token](results/figures/final-ttft-p50.png)
+
+| System prompts | Policy | Cache hit rate | TTFT p50 | TTFT p95 |
+|---|---|---|---|---|
+| 4 | Round-robin | 78.0% | 2.54s | 5.07s |
+| 4 | Cache-aware | 79.3% | 2.11s | 4.05s |
+| 4 | Hybrid | 78.0% | 2.40s | 4.96s |
+| 16 | Round-robin | 72.0% | 3.29s | 6.96s |
+| 16 | Cache-aware | 76.3% | 2.94s | 5.68s |
+| 16 | Hybrid | 74.0% | 4.72s | 11.12s |
+| 64 | Round-robin | 53.9% | 7.20s | 14.80s |
+| 64 | Cache-aware | **66.5%** | **4.20s** | **8.74s** |
+| 64 | Hybrid | 64.9% | 5.67s | 12.66s |
+| 128 | Round-robin | 43.9% | 9.14s | 21.65s |
+| 128 | Cache-aware | **60.2%** | **6.12s** | 14.11s |
+| 128 | Hybrid | 59.8% | 7.02s | **13.26s** |
+
+These are means of 3 runs. The per-run ranges are in [`results/final-summary.md`](results/final-summary.md), and the tail-latency chart is [`results/figures/final-ttft-p95.png`](results/figures/final-ttft-p95.png).
+
+**What the results show:**
+
+- **The benefit comes from not duplicating the cache.** Round-robin eventually stores every system prompt on both replicas, so together they hold no more distinct prompts than one replica does. Cache-aware routing splits the prompts between the replicas, which roughly doubles the effective cache size. With 4 or 16 prompts (about 2k–7k tokens), everything fits in each replica's ~43k-token cache anyway, and the policies tie. At 64 and 128 prompts it no longer fits, and the hit-rate gap opens: +12.6 points at 64 and +16.3 at 128.
+- **Hit rate is the most stable measurement.** Repeated runs agree within 1–5 points, and an earlier single-repeat experiment (`exp3`) gave nearly the same values. Latency moved by up to 1.5–2x between sessions on the same host, so compare latencies within this table, not across experiments.
+- **The hybrid policy did not pay off here.** Its hit rate is close to cache-aware's, but its median latency was higher at 16 and 64 prompts in every run. The likely cause is that it sends a request away from its cached replica when there is a momentary load imbalance, and so pays for a full prefill. This has not been confirmed. The workload has no single dominant prompt, which is the hotspot case the hybrid policy is designed for, so this setup does not test where it should help.
+
+**Caveats:** CPU only, a 0.5B model, 2 replicas, and 3 runs per configuration. The benchmark method, including a run-order bias found and corrected along the way, is described in [`results/NOTES.md`](results/NOTES.md).
 
 ## Setup
 

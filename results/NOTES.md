@@ -82,3 +82,22 @@ Same settings as exp2 (`SESSION_RATE=0.8`, `SEED=1`), round-robin vs cache-aware
 - **This contradicts part of the exp2 hypothesis.** Exp2's latency gap narrowed at N=128, but the hit-rate gap keeps widening. Round-robin keeps losing cache to duplication even when neither policy fits the full working set.
 - **Absolute latencies were 1.5–2x higher than in exp2** for the same settings. The host was on AC power, with no sleeps and no thermal warnings recorded; the cause is unknown, possibly other activity on the host during the day. Within-run comparisons still hold. Hit rate does not depend on host speed, which makes it the more robust metric of the two.
 - The `N=16` latency gap (5.04s vs 2.45s p50) is much larger than the hit-rate gap suggests, and much larger than in exp2. Treat it as noise until it is repeated.
+
+## Final dataset (`final-*`)
+
+This is the dataset behind the README results. It sweeps `N_SYSTEM_PROMPTS` over 4, 16, 64, and 128 for all three policies, with 3 repeats (`SEED` = repeat number), giving 36 runs.
+
+- **Settings:** `SESSION_RATE=0.8`, `DURATION=120`, `TURNS=3`, `THINK_TIME=2`, `MAX_TOKENS=8`.
+- **Run order:** rotates between blocks, with a 60s pause after each run.
+- **Cache counters:** recorded for every run.
+- **Health:** no pod restarted during the sweep. One request failed out of all runs, in `final-n16-rep2-cache_aware`.
+
+`results/analyze.py final` produces `final-summary.md` (mean and min–max per configuration) and the charts in `figures/`.
+
+**Possible contamination:** chart-rendering tests ran in Docker on the host during `final-n4-rep1-round_robin`. Its latencies are the highest of the three N=4 round-robin repeats (p50 3.58s, against 2.30s and 1.74s). Its hit rate (78%) matches the other two. N=4 is not a configuration the conclusions depend on, so the run is kept but should be read with this in mind.
+
+**Observations:**
+
+- **Hit rate replicates exp3 closely.** The gap between cache-aware and round-robin is +1.3 points at N=4, +4.3 at 16, +12.6 at 64, and +16.3 at 128.
+- **Latency:** at N=64 and N=128, no cache-aware run was slower than any round-robin run at p50.
+- **Hybrid** was slower than cache-aware at p50 in every repeat at N=16 and N=64, with a similar hit rate. One untested explanation: spills to the other replica pay for a full prefill, and on CPU a full prefill is expensive enough to outweigh the queueing they avoid.
