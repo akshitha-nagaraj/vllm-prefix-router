@@ -63,5 +63,22 @@ Sweeps `N_SYSTEM_PROMPTS` over 4, 16, 64, and 128 at `SESSION_RATE=0.8`. Everyth
 - **N=4 and N=16:** no meaningful difference between policies. All system prompts fit in each replica's cache, so round-robin hits on them too.
 - **N=64:** cache-aware is clearly better, and consistently so in both repeats. p50 TTFT is 2.7–3.0s against 4.0–4.6s for round-robin, and p95 is 5.1–6.3s against 8.0–8.9s.
 - **N=128:** cache-aware and hybrid both beat round-robin, but by less. p50 is about 15–25% lower and p95 about 15–30% lower.
-- **Mechanism:** the gap opening at N=64 and narrowing at N=128 fits the cache-duplication argument. 64 prompts of ~750 tokens is about 48k tokens. That exceeds one replica's ~43k-token cache when round-robin copies every prompt onto both replicas, but fits when cache-aware routing splits the prompts between them. At 128, neither policy fits the working set. This is inferred from latency only; per-run cache hit and eviction counts were not recorded.
+- **Mechanism (hypothesis):** the gap opening at N=64 and narrowing at N=128 suggests cache duplication. Round-robin copies every system prompt onto both replicas, while cache-aware routing splits them. This was inferred from latency only, because per-run cache hits were not recorded in exp2. An earlier estimate of ~750 tokens per system prompt was too high: measured, it is about 420 tokens. So 64 prompts are ~27k tokens, plus conversation histories, against a ~43k-token cache per replica. That is tighter than first claimed. `exp3-*` measures the hit rates directly.
 - **Hybrid** matched cache-aware in rep 2 at N=64 but matched round-robin in rep 1. With `MIN_GAP=4` it may be spilling often enough to break the partitioning. This is unconfirmed.
+
+## Experiment 3: measured cache hit rates (`exp3-*`)
+
+Same settings as exp2 (`SESSION_RATE=0.8`, `SEED=1`), round-robin vs cache-aware only, one repeat. The load generator now reads each replica's vLLM prefix-cache counters before and after the run (`*.metrics.json`). Hit rate is the fraction of prompt tokens served from cache.
+
+| N | Round-robin hit rate | Cache-aware hit rate | Round-robin TTFT p50 / p95 (s) | Cache-aware TTFT p50 / p95 (s) |
+|---|---|---|---|---|
+| 16 | 71.7% | 76.5% | 5.04 / 9.24 | 2.45 / 5.55 |
+| 64 | 53.9% | 66.0% | 6.80 / 12.85 | 5.55 / 11.56 |
+| 128 | 41.6% | 59.2% | 9.39 / 17.90 | 6.67 / 13.54 |
+
+**Observations:**
+
+- **Cache-aware routing has the higher hit rate at every N,** and the gap grows with prompt diversity: +5 points at 16, +12 at 64, and +18 at 128. This confirms that the latency advantage comes with more cache reuse.
+- **This contradicts part of the exp2 hypothesis.** Exp2's latency gap narrowed at N=128, but the hit-rate gap keeps widening. Round-robin keeps losing cache to duplication even when neither policy fits the full working set.
+- **Absolute latencies were 1.5–2x higher than in exp2** for the same settings. The host was on AC power, with no sleeps and no thermal warnings recorded; the cause is unknown, possibly other activity on the host during the day. Within-run comparisons still hold. Hit rate does not depend on host speed, which makes it the more robust metric of the two.
+- The `N=16` latency gap (5.04s vs 2.45s p50) is much larger than the hit-rate gap suggests, and much larger than in exp2. Treat it as noise until it is repeated.

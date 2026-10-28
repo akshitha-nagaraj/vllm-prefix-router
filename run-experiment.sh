@@ -5,7 +5,8 @@
 #   ./run-experiment.sh cache_aware shared-4 SESSION_RATE=0.3 N_SYSTEM_PROMPTS=4
 #
 # VAR=value pairs are passed to the load generator (see loadgen/loadgen.py).
-# Results go to results/<name>-<policy>.csv.
+# Results go to results/<name>-<policy>.csv (per request) and
+# results/<name>-<policy>.metrics.json (per-replica vLLM cache counters for the run).
 set -euo pipefail
 
 policy=$1
@@ -51,6 +52,8 @@ EOF
 echo "running: policy=$policy $*" >&2
 kubectl wait --for=condition=complete job/loadgen --timeout=3600s >/dev/null
 mkdir -p results
-kubectl logs job/loadgen | sed -n '/^---CSV---$/,$p' | tail -n +2 > "results/$name-$policy.csv"
-kubectl logs job/loadgen | sed '/^---CSV---$/,$d' >&2
-echo "saved results/$name-$policy.csv" >&2
+logs=$(kubectl logs job/loadgen)
+sed -n '/^---CSV---$/,$p' <<<"$logs" | tail -n +2 > "results/$name-$policy.csv"
+sed -n '/^---METRICS---$/{n;p;}' <<<"$logs" > "results/$name-$policy.metrics.json"
+sed '/^---METRICS---$/,$d' <<<"$logs" >&2
+echo "saved results/$name-$policy.csv and .metrics.json" >&2
