@@ -1,0 +1,3 @@
+# Model weights and caches downloaded at runtime (~1GB, not source)
+hf-cache/
+.DS_Store

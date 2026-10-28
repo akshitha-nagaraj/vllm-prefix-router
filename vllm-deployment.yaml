@@ -1,0 +1,84 @@
+# Runs N identical vLLM servers ("replicas"). Kubernetes keeps exactly that many
+# pods alive, restarting or replacing any that crash.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+spec:
+  replicas: 2
+  # Stop old pods before starting new ones on an update. The default (rolling
+  # update) briefly runs an extra pod, which doesn't fit in the laptop's memory.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm # how the Service (and our router) will find these pods
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-cpu:v0.31.0-arm64 # v0.32.0 crashes on arm64 CPU
+          imagePullPolicy: IfNotPresent # use the copy we loaded with `kind load`
+          args:
+            - --model=Qwen/Qwen2.5-0.5B-Instruct
+            - --dtype=float16
+            - --max-model-len=4096
+            # Skip torch.compile: its startup peak overflows the 5Gi limit, and
+            # slower-but-identical execution across replicas is fine for comparing
+            # routing policies.
+            - --enforce-eager
+            # Run the model in the engine process instead of a separate worker
+            # process: saves ~1.5GB (one fewer copy of PyTorch in memory).
+            - --distributed-executor-backend=uni
+            # KV cache = 512MB (~43k tokens). Small on purpose: memory is tight,
+            # and cache pressure is part of the experiment.
+            - --kv-cache-memory-bytes=536870912
+          env:
+            - name: HF_HOME # download model weights into the shared cache folder
+              value: /hf-cache
+            - name: OMP_NUM_THREADS # match the CPU limit; vLLM otherwise sees all
+              value: "4"            # host cores and gets throttled by the quota
+          ports:
+            - containerPort: 8000
+          resources:
+            # requests = what the scheduler reserves; limits = hard cap.
+            # Measured ~3.5GiB process memory + ~1.1GiB reclaimable file cache
+            # per pod (/dev/shm also counts against the limit).
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 5632Mi
+          # Don't send traffic until the model is loaded and warmed up.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 120 # allow up to 10 min for first download + compile
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: hf-cache
+              mountPath: /hf-cache
+      volumes:
+        # vLLM needs >64MB of shared memory (the container default); this is the
+        # Kubernetes equivalent of `docker run --shm-size=1g`.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        # The Mac folder mounted into the kind node (see kind-config.yaml).
+        - name: hf-cache
+          hostPath:
+            path: /hf-cache
+            type: Directory
