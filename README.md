@@ -23,12 +23,9 @@ A router in front of the vLLM replicas that compares three policies:
 | Cache-aware | Sends each request to the replica with the longest matching prefix. |
 | Hybrid | Cache-aware, but falls back to the least-loaded replica when the preferred one's in-flight request count exceeds the least-loaded one's by more than a threshold. |
 
-All three policies run inside the same router, so measured differences come from the policy rather than from the network path. The questions to answer:
+All three policies run inside the same router, so measured differences come from the policy rather than from the network path. The experiments measure how much cache hit rate and time-to-first-token improve over round-robin as the number of distinct system prompts, and so the cache pressure, grows.
 
-- How much do cache hit rate and time-to-first-token improve over round-robin, and under which traffic patterns (shared system prompts, multi-turn chat, unique prompts)?
-- Where does pure cache affinity start to hurt because of load imbalance?
-- How should the hybrid threshold be set, and does it depend on the workload?
-- How do the gains change with the number of replicas and with cache pressure?
+Not tested here: more than 2 replicas, tuning the hybrid thresholds, and workloads dominated by one very popular prompt (the hotspot case the hybrid policy is designed for).
 
 ## Results
 
