@@ -61,6 +61,20 @@ The routing policy is set with the `POLICY` environment variable in `router-depl
 
 The router adds an `x-routed-to` response header naming the replica that served each request, and `GET /stats` shows the current replicas, in-flight counts, and routing table size.
 
+### Running experiments
+
+The load generator (`loadgen/`) simulates chat users and runs inside the cluster as a Kubernetes Job. New sessions arrive at a fixed average rate (a Poisson process), regardless of how fast the system responds, so overload shows up as rising latency rather than as reduced load. Within a session, each turn waits for the previous reply and resends the whole conversation, which produces the multi-turn prefix reuse the router targets. Each run warms up every replica first, and it puts a fresh run ID into its system prompts so that prefixes cached by earlier runs can't produce hits.
+
+```bash
+docker build -t vllm-loadgen:dev loadgen/
+kind load docker-image vllm-loadgen:dev --name vllm
+
+# ./run-experiment.sh <policy> <name> [VAR=value ...]
+./run-experiment.sh cache_aware shared-4 SESSION_RATE=0.3 N_SYSTEM_PROMPTS=4 TURNS=3
+```
+
+The script restarts the router with the chosen policy, so every run starts with an empty routing table, and writes one CSV row per request to `results/<name>-<policy>.csv`. Each row records the session, turn, prompt length, the replica that served it, time-to-first-token, and total latency. The workload is controlled by `SESSION_RATE`, `DURATION`, `N_SYSTEM_PROMPTS`, `SYSTEM_PROMPT_CHARS`, `TURNS`, `USER_MSG_CHARS`, `THINK_TIME`, and `MAX_TOKENS`.
+
 ### Notes on running vLLM on CPU in Kubernetes
 
 These settings were needed to fit two replicas in ~12GB. Each is explained in `vllm-deployment.yaml`.
