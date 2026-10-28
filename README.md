@@ -64,13 +64,3 @@ These settings were needed to fit two replicas in ~12GB. Each is explained in `v
 - **`strategy: Recreate`:** a rolling update would briefly need a third pod, which doesn't fit.
 
 Measured memory is ~4.6GiB per pod.
-
-## Roadmap
-
-- [x] kind cluster and multi-replica vLLM deployment
-- [x] Verify prefix caching on the CPU backend
-- [ ] Service for replica discovery
-- [ ] Router with round-robin, cache-aware, and hybrid policies
-- [ ] Load generator with configurable prefix-sharing workloads
-- [ ] Benchmarks: hit rate, TTFT, and throughput per policy
-- [ ] Results and analysis
