@@ -2,24 +2,24 @@
 
 Prefix-cache-aware request routing for multi-replica vLLM on Kubernetes.
 
-**Result:** once the system prompts no longer fit in one replica's cache, routing requests by prompt prefix served up to 16 points more prompt tokens from cache than round-robin, and cut median time to first token by up to 42%. [Details below.](#results)
+Once the system prompts no longer fit in one replica's cache, routing requests by prompt prefix served up to 16 points more prompt tokens from cache than round-robin, and cut median time to first token by up to 42%. [Details below.](#results)
 
 ## The problem
 
 vLLM caches the KV state of prompt prefixes it has already processed (automatic prefix caching). When a new request shares a prefix with an earlier one, such as the same system prompt or an earlier turn of the same conversation, vLLM skips recomputing it. On a single replica this is a large win. In a quick test on this setup, a ~2.3k-token prompt took 12.4s cold and 0.32s when its prefix was cached.
 
-With several replicas behind a standard load balancer, that benefit mostly disappears:
+With several replicas behind a standard load balancer, that benefit mostly disappears.
 
-- **Repeated misses:** a prefix misses once on *every* replica instead of once overall.
-- **Duplicated cache:** each replica caches the same popular prefixes, so the cluster's effective cache capacity is divided by the number of replicas, and prefixes get evicted sooner.
+- **Repeated misses.** A prefix misses once on *every* replica instead of once overall.
+- **Duplicated cache.** Each replica caches the same popular prefixes, so the cluster's effective cache capacity is divided by the number of replicas, and prefixes get evicted sooner.
 
-Routing every request to the replica that holds its prefix fixes this, but it creates hotspots: if one prefix is very popular, a pure cache-affinity router sends all of it to one replica while the others sit idle.
+Routing every request to the replica that holds its prefix fixes this, but it creates hotspots. If one prefix is very popular, a pure cache-affinity router sends all of it to one replica while the others sit idle.
 
 I chose this problem because getting vLLM running on Kubernetes is mostly configuration work. Deciding where each request should go is a real systems tradeoff between cache reuse and load balance, and it can be measured.
 
 ## Approach
 
-A router in front of the vLLM replicas that compares three policies:
+A router sits in front of the vLLM replicas and compares three policies.
 
 | Policy | Behavior |
 |---|---|
@@ -29,13 +29,13 @@ A router in front of the vLLM replicas that compares three policies:
 
 I used round-robin as the baseline because it is what a standard Kubernetes Service effectively does. All three policies run inside the same router, so measured differences come from the policy rather than from the network path. The experiments measure how much cache hit rate and time-to-first-token improve over round-robin as the number of distinct system prompts, and so the cache pressure, grows.
 
-Not tested here: more than 2 replicas, tuning the hybrid thresholds, and workloads dominated by one very popular prompt (the hotspot case the hybrid policy is designed for).
+I did not test more than 2 replicas, tuning the hybrid thresholds, and workloads dominated by one very popular prompt (the hotspot case the hybrid policy is designed for).
 
 ## Results
 
 **When the set of distinct system prompts is larger than one replica's cache, cache-aware routing serves 13–16 percentage points more prompt tokens from cache than round-robin, and cuts median time to first token by 33–42%.** When every prompt fits in each replica's cache, the policies perform about the same.
 
-The workload is multi-turn chat on 2 replicas: about 0.8 new sessions per second for 2 minutes, 3 turns per session, and a ~420-token system prompt drawn from N distinct prompts. Each configuration was run 3 times. Lines show the mean, and the faint dots show the individual runs.
+The workload is multi-turn chat on 2 replicas, with about 0.8 new sessions per second for 2 minutes, 3 turns per session, and a ~420-token system prompt drawn from N distinct prompts. Each configuration was run 3 times. Lines show the mean, and the faint dots show the individual runs.
 
 I held think time and reply length fixed and varied the number of distinct system prompts, because that controls cache pressure directly. I capped replies at 8 tokens because CPU decoding is slow enough to swamp the prefill time that routing affects. I report hit rate as well as latency because it measures the mechanism directly, and it doesn't drift with host speed the way latency did between sessions.
 
@@ -60,19 +60,21 @@ I held think time and reply length fixed and varied the number of distinct syste
 
 These are means of 3 runs. The per-run ranges are in [`results/final-summary.md`](results/final-summary.md), and the tail-latency chart is [`results/figures/final-ttft-p95.png`](results/figures/final-ttft-p95.png).
 
-**What the results show:**
+**What the results show**
 
-- **The benefit comes from not duplicating the cache.** Round-robin eventually stores every system prompt on both replicas, so together they hold no more distinct prompts than one replica does. Cache-aware routing splits the prompts between the replicas, which roughly doubles the effective cache size. With 4 or 16 prompts (about 2k–7k tokens), everything fits in each replica's ~43k-token cache anyway, and the policies tie. At 64 and 128 prompts it no longer fits, and the hit-rate gap opens: +12.6 points at 64 and +16.3 at 128.
+- **The benefit comes from not duplicating the cache.** Round-robin eventually stores every system prompt on both replicas, so together they hold no more distinct prompts than one replica does. Cache-aware routing splits the prompts between the replicas, which roughly doubles the effective cache size. With 4 or 16 prompts (about 2k–7k tokens), everything fits in each replica's ~43k-token cache anyway, and the policies tie. At 64 and 128 prompts it no longer fits, and the hit-rate gap opens to +12.6 points at 64 and +16.3 at 128.
 - **Hit rate is the most stable measurement.** Repeated runs agree within 1–5 points, and an earlier single-repeat experiment (`exp3`) gave nearly the same values. Latency moved by up to 1.5–2x between sessions on the same host, so compare latencies within this table, not across experiments.
 - **The hybrid policy did not pay off here.** Its hit rate is close to cache-aware's, but its median latency was higher at 16 and 64 prompts in every run. The likely cause is that it sends a request away from its cached replica when there is a momentary load imbalance, and so pays for a full prefill. This has not been confirmed. The workload has no single dominant prompt, which is the hotspot case the hybrid policy is designed for, so this setup does not test where it should help.
 
-**Caveats:** CPU only, a 0.5B model, 2 replicas, and 3 runs per configuration.
+**Caveats.** These runs used a CPU only, a 0.5B model, 2 replicas, and 3 runs per configuration.
 
-**A lesson from the benchmarking:** my first experiment made the hybrid policy look much worse under heavy load. When I re-ran it with the policy order reversed, whichever policy ran last in a block was slowest, regardless of which policy it was. After that, I rotated the order and paused between runs. The full experiment log is in [`results/NOTES.md`](results/NOTES.md).
+**A lesson from the benchmarking.** My first experiment made the hybrid policy look much worse under heavy load. When I re-ran it with the policy order reversed, whichever policy ran last in a block was slowest, regardless of which policy it was. After that, I rotated the order and paused between runs. The full experiment log is in [`results/NOTES.md`](results/NOTES.md).
 
 ## Setup
 
 Runs locally on [kind](https://kind.sigs.k8s.io/) on an Apple Silicon Mac (CPU only), with Docker Desktop given ~12GB of memory.
+
+I ran this on a laptop rather than on rented GPUs to keep the cost at zero and to make every experiment easy to rerun. The routing question doesn't depend on the hardware, since duplicated prefixes waste cache whether that cache lives in CPU or GPU memory, and hit rate measures that directly. On a CPU, prefill is slow, so a cache miss costs more and the latency gaps are probably wider than they would be on a GPU. The hit-rate results should carry over more closely than the absolute latencies.
 
 | Component | Choice |
 |---|---|
@@ -117,12 +119,12 @@ The script restarts the router with the chosen policy, so every run starts with 
 
 These settings were needed to fit two replicas in ~12GB. Each is explained in `vllm-deployment.yaml`.
 
-- **Image version:** `v0.32.0-arm64` crashes on the first request on arm64 CPU, so the image is pinned to `v0.31.0`.
-- **Shared memory:** vLLM needs more than the container default of 64MB of `/dev/shm`, so a memory-backed `emptyDir` is mounted there.
-- **Thread count:** `OMP_NUM_THREADS` must match the CPU limit. Otherwise vLLM sizes its thread pool to the host's cores and gets throttled by the cgroup CPU quota.
-- **No compilation:** `--enforce-eager` skips torch.compile, whose startup memory peak exceeds the per-pod limit.
-- **Single process:** `--distributed-executor-backend=uni` runs the model in the engine process rather than a separate worker process, which saves ~1.5GB per pod.
-- **Small KV cache:** `--kv-cache-memory-bytes` is set to 512MB (about 43k tokens).
-- **`strategy: Recreate`:** a rolling update would briefly need a third pod, which doesn't fit.
+- **Image version.** `v0.32.0-arm64` crashes on the first request on arm64 CPU, so the image is pinned to `v0.31.0`.
+- **Shared memory.** vLLM needs more than the container default of 64MB of `/dev/shm`, so a memory-backed `emptyDir` is mounted there.
+- **Thread count.** `OMP_NUM_THREADS` must match the CPU limit. Otherwise vLLM sizes its thread pool to the host's cores and gets throttled by the cgroup CPU quota.
+- **No compilation.** `--enforce-eager` skips torch.compile, whose startup memory peak exceeds the per-pod limit.
+- **Single process.** `--distributed-executor-backend=uni` runs the model in the engine process rather than a separate worker process, which saves ~1.5GB per pod.
+- **Small KV cache.** `--kv-cache-memory-bytes` is set to 512MB (about 43k tokens).
+- **Recreate strategy.** A rolling update would briefly need a third pod, which doesn't fit.
 
 Measured memory is ~4.6GiB per pod.
