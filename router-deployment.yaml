@@ -18,6 +18,9 @@ spec:
         - name: router
           image: vllm-router:dev
           imagePullPolicy: Never # built locally and loaded with `kind load`
+          env:
+            - name: POLICY # round_robin | cache_aware
+              value: cache_aware
           ports:
             - containerPort: 8080
           resources:

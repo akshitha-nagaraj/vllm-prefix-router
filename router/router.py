@@ -7,9 +7,11 @@ All routing state lives in this one process, so run exactly one worker.
 
 import asyncio
 import itertools
+import json
 import logging
 import os
 import socket
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import httpx
@@ -19,9 +21,47 @@ from fastapi.responses import JSONResponse, StreamingResponse
 BACKEND_HOST = os.environ.get("BACKEND_HOST", "vllm.default.svc.cluster.local")
 BACKEND_PORT = int(os.environ.get("BACKEND_PORT", "8000"))
 REFRESH_SECONDS = float(os.environ.get("REFRESH_SECONDS", "2"))
+POLICY = os.environ.get("POLICY", "round_robin")
+# Prompts are matched in chunks of this many characters. vLLM caches in blocks of
+# 16 tokens (~64 chars), so matching much finer than that gains nothing.
+CHUNK_CHARS = int(os.environ.get("CHUNK_CHARS", "128"))
+# How many chunks to remember per replica. 1300 x 128 chars ~ 43k tokens, about
+# one replica's KV cache, so the table forgets at roughly the rate vLLM evicts.
+CHUNKS_PER_BACKEND = int(os.environ.get("CHUNKS_PER_BACKEND", "1300"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("router")
+
+
+def prompt_text(body: bytes) -> str:
+    """The prompt text in the order vLLM will see it. For chat requests the messages
+    are concatenated, so each new turn's text starts with the previous turn's."""
+    try:
+        request = json.loads(body)
+    except ValueError:
+        return ""
+    if isinstance(request.get("prompt"), str):
+        return request["prompt"]
+    return "".join(f"{m.get('role')}:{m.get('content')}\n" for m in request.get("messages", []))
+
+
+def chunk_hashes(text: str) -> list[int]:
+    """Chained hashes of each full chunk: hash i covers all the text up to the end
+    of chunk i, so two prompts share hash i only if they share that whole prefix.
+    A trailing partial chunk is skipped, like vLLM skips partial blocks."""
+    hashes, h = [], 0
+    for start in range(0, len(text) - CHUNK_CHARS + 1, CHUNK_CHARS):
+        h = hash((h, text[start : start + CHUNK_CHARS]))
+        hashes.append(h)
+    return hashes
+
+
+def least_busy(backends: list[str], in_flight: dict[str, int], counter) -> str:
+    """Replica with the fewest in-flight requests. Ties rotate, so idle replicas
+    share new work instead of the first one in the list getting all of it."""
+    start = next(counter) % len(backends)
+    rotated = backends[start:] + backends[:start]
+    return min(rotated, key=lambda b: in_flight.get(b, 0))
 
 
 class RoundRobin:
@@ -30,11 +70,52 @@ class RoundRobin:
     def __init__(self):
         self._counter = itertools.count()
 
-    def choose(self, backends: list[str], body: bytes) -> str:
+    def choose(self, backends: list[str], body: bytes, in_flight: dict[str, int]) -> str:
         return backends[next(self._counter) % len(backends)]
 
+    def forget(self, removed: set[str]):
+        pass
 
-policy = RoundRobin()
+
+class CacheAware:
+    """Send each request to the replica that most recently served its longest
+    known prefix. Requests with no known prefix go to the least-busy replica."""
+
+    def __init__(self):
+        self._counter = itertools.count()
+        self.table: OrderedDict[int, str] = OrderedDict()  # chunk hash -> replica, oldest first
+
+    def choose(self, backends: list[str], body: bytes, in_flight: dict[str, int]) -> str:
+        hashes = chunk_hashes(prompt_text(body))
+        # Walk the chain until the first unknown chunk. The deepest match wins: that
+        # replica processed the entire prefix up to that point.
+        backend = None
+        for h in hashes:
+            owner = self.table.get(h)
+            if owner is None or owner not in backends:
+                break
+            backend = owner
+        if backend is None:
+            backend = least_busy(backends, in_flight, self._counter)
+        self._record(hashes, backend, len(backends))
+        return backend
+
+    def _record(self, hashes: list[int], backend: str, n_backends: int):
+        """The chosen replica will now cache this whole prompt, so point every chunk
+        at it, marking them recently used, then drop the least recently used."""
+        for h in hashes:
+            self.table[h] = backend
+            self.table.move_to_end(h)
+        while len(self.table) > CHUNKS_PER_BACKEND * n_backends:
+            self.table.popitem(last=False)
+
+    def forget(self, removed: set[str]):
+        """A replica that disappeared (and any replacement) starts with an empty cache."""
+        self.table = OrderedDict((h, b) for h, b in self.table.items() if b not in removed)
+
+
+POLICIES = {"round_robin": RoundRobin, "cache_aware": CacheAware}
+policy = POLICIES[POLICY]()
 backends: list[str] = []  # IPs of ready vLLM pods, kept sorted for a stable order
 in_flight: dict[str, int] = {}  # requests sent to each backend and not yet finished
 
@@ -52,6 +133,7 @@ async def refresh_backends():
             found = []  # no ready pods: the name doesn't resolve at all
         if found != backends:
             log.info("backends changed: %s -> %s", backends, found)
+            policy.forget(set(backends) - set(found))
             backends = found
         await asyncio.sleep(REFRESH_SECONDS)
 
@@ -77,7 +159,12 @@ async def health():
 
 @app.get("/stats")
 async def stats():
-    return {"policy": type(policy).__name__, "backends": backends, "in_flight": in_flight}
+    return {
+        "policy": type(policy).__name__,
+        "backends": backends,
+        "in_flight": in_flight,
+        "table_chunks": len(getattr(policy, "table", {})),
+    }
 
 
 @app.post("/v1/{path:path}")
@@ -86,7 +173,7 @@ async def proxy(path: str, request: Request):
     if not backends:
         return JSONResponse({"error": "no ready backends"}, status_code=503)
 
-    backend = policy.choose(backends, body)
+    backend = policy.choose(backends, body, in_flight)
     upstream = client.build_request(
         "POST",
         f"http://{backend}:{BACKEND_PORT}/v1/{path}",
