@@ -47,7 +47,7 @@ Runs locally on [kind](https://kind.sigs.k8s.io/) on an Apple Silicon Mac (CPU o
 mkdir -p hf-cache
 kind create cluster --config kind-config.yaml
 kind load docker-image vllm/vllm-openai-cpu:v0.31.0-arm64 --name vllm
-kubectl apply -f vllm-deployment.yaml
+kubectl apply -f vllm-deployment.yaml -f vllm-service.yaml
 kubectl rollout status deployment/vllm
 ```
 

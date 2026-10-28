@@ -1,0 +1,18 @@
+# Gives the vLLM pods a stable DNS name the router can use to find them.
+#
+# "Headless" (clusterIP: None) means Kubernetes does NOT load-balance for us:
+# looking up the name returns every ready pod's IP, and the router picks one
+# itself. A normal Service would hide the pods behind one virtual IP and choose
+# a pod per connection, which would take routing out of our hands.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  clusterIP: None
+  selector:
+    app: vllm # matches the label on the Deployment's pods
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
