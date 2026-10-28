@@ -57,7 +57,7 @@ kubectl apply -f router-deployment.yaml
 kubectl port-forward svc/router 8080:8080   # then send OpenAI-style requests to localhost:8080
 ```
 
-The routing policy is set with the `POLICY` environment variable in `router-deployment.yaml` (`round_robin` or `cache_aware`). The cache-aware policy matches prompts in chained-hash chunks of `CHUNK_CHARS` characters (default 128) and remembers about one replica's KV cache worth of chunks per replica (`CHUNKS_PER_BACKEND`).
+The routing policy is set with the `POLICY` environment variable in `router-deployment.yaml` (`round_robin`, `cache_aware`, or `hybrid`). The cache-aware policy matches prompts in chained-hash chunks of `CHUNK_CHARS` characters (default 128) and remembers about one replica's KV cache worth of chunks per replica (`CHUNKS_PER_BACKEND`). The hybrid policy leaves the cached replica only when its in-flight count exceeds the least-busy replica's by at least `MIN_GAP` requests (default 4) and by at least a factor of `MIN_RATIO` (default 1.5).
 
 The router adds an `x-routed-to` response header naming the replica that served each request, and `GET /stats` shows the current replicas, in-flight counts, and routing table size.
 

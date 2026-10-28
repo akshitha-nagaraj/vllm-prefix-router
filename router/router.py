@@ -28,6 +28,11 @@ CHUNK_CHARS = int(os.environ.get("CHUNK_CHARS", "128"))
 # How many chunks to remember per replica. 1300 x 128 chars ~ 43k tokens, about
 # one replica's KV cache, so the table forgets at roughly the rate vLLM evicts.
 CHUNKS_PER_BACKEND = int(os.environ.get("CHUNKS_PER_BACKEND", "1300"))
+# Hybrid policy: leave the cached replica only if it has at least MIN_GAP more
+# in-flight requests than the least-busy one AND at least MIN_RATIO times as many.
+# The gap check ignores small-count noise (1 vs 0); the ratio check scales with load.
+MIN_GAP = int(os.environ.get("MIN_GAP", "4"))
+MIN_RATIO = float(os.environ.get("MIN_RATIO", "1.5"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("router")
@@ -87,17 +92,21 @@ class CacheAware:
 
     def choose(self, backends: list[str], body: bytes, in_flight: dict[str, int]) -> str:
         hashes = chunk_hashes(prompt_text(body))
-        # Walk the chain until the first unknown chunk. The deepest match wins: that
-        # replica processed the entire prefix up to that point.
+        backend = self._longest_match(hashes, backends)
+        if backend is None:
+            backend = least_busy(backends, in_flight, self._counter)
+        self._record(hashes, backend, len(backends))
+        return backend
+
+    def _longest_match(self, hashes: list[int], backends: list[str]) -> str | None:
+        """Walk the chain until the first unknown chunk. The deepest match wins: that
+        replica processed the entire prefix up to that point."""
         backend = None
         for h in hashes:
             owner = self.table.get(h)
             if owner is None or owner not in backends:
                 break
             backend = owner
-        if backend is None:
-            backend = least_busy(backends, in_flight, self._counter)
-        self._record(hashes, backend, len(backends))
         return backend
 
     def _record(self, hashes: list[int], backend: str, n_backends: int):
@@ -114,7 +123,26 @@ class CacheAware:
         self.table = OrderedDict((h, b) for h, b in self.table.items() if b not in removed)
 
 
-POLICIES = {"round_robin": RoundRobin, "cache_aware": CacheAware}
+class Hybrid(CacheAware):
+    """Cache-aware, but abandon the cached replica when it is clearly overloaded
+    compared with the least-busy one (see MIN_GAP and MIN_RATIO)."""
+
+    def choose(self, backends: list[str], body: bytes, in_flight: dict[str, int]) -> str:
+        hashes = chunk_hashes(prompt_text(body))
+        idlest = least_busy(backends, in_flight, self._counter)
+        backend = self._longest_match(hashes, backends)
+        if backend is None:
+            backend = idlest
+        else:
+            load, idle_load = in_flight.get(backend, 0), in_flight.get(idlest, 0)
+            if load - idle_load >= MIN_GAP and load >= MIN_RATIO * idle_load:
+                backend = idlest
+        # Whichever replica runs the request will cache its prefix, so record that one.
+        self._record(hashes, backend, len(backends))
+        return backend
+
+
+POLICIES = {"round_robin": RoundRobin, "cache_aware": CacheAware, "hybrid": Hybrid}
 policy = POLICIES[POLICY]()
 backends: list[str] = []  # IPs of ready vLLM pods, kept sorted for a stable order
 in_flight: dict[str, int] = {}  # requests sent to each backend and not yet finished
