@@ -49,7 +49,15 @@ kind create cluster --config kind-config.yaml
 kind load docker-image vllm/vllm-openai-cpu:v0.31.0-arm64 --name vllm
 kubectl apply -f vllm-deployment.yaml -f vllm-service.yaml
 kubectl rollout status deployment/vllm
+
+# Router
+docker build -t vllm-router:dev router/
+kind load docker-image vllm-router:dev --name vllm
+kubectl apply -f router-deployment.yaml
+kubectl port-forward svc/router 8080:8080   # then send OpenAI-style requests to localhost:8080
 ```
+
+The router adds an `x-routed-to` response header naming the replica that served each request, and `GET /stats` shows the current replicas and in-flight counts.
 
 ### Notes on running vLLM on CPU in Kubernetes
 
