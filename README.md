@@ -2,6 +2,8 @@
 
 Prefix-cache-aware request routing for multi-replica vLLM on Kubernetes.
 
+**Result:** once the system prompts no longer fit in one replica's cache, routing requests by prompt prefix served up to 16 points more prompt tokens from cache than round-robin, and cut median time to first token by up to 42%. [Details below.](#results)
+
 ## The problem
 
 vLLM caches the KV state of prompt prefixes it has already processed (automatic prefix caching). When a new request shares a prefix with an earlier one, such as the same system prompt or an earlier turn of the same conversation, vLLM skips recomputing it. On a single replica this is a large win. In a quick test on this setup, a ~2.3k-token prompt took 12.4s cold and 0.32s when its prefix was cached.
@@ -13,6 +15,8 @@ With several replicas behind a standard load balancer, that benefit mostly disap
 
 Routing every request to the replica that holds its prefix fixes this, but it creates hotspots: if one prefix is very popular, a pure cache-affinity router sends all of it to one replica while the others sit idle.
 
+I chose this problem because getting vLLM running on Kubernetes is mostly configuration work. Deciding where each request should go is a real systems tradeoff between cache reuse and load balance, and it can be measured.
+
 ## Approach
 
 A router in front of the vLLM replicas that compares three policies:
@@ -23,7 +27,7 @@ A router in front of the vLLM replicas that compares three policies:
 | Cache-aware | Sends each request to the replica with the longest matching prefix. |
 | Hybrid | Cache-aware, but falls back to the least-loaded replica when the preferred one's in-flight request count exceeds the least-loaded one's by more than a threshold. |
 
-All three policies run inside the same router, so measured differences come from the policy rather than from the network path. The experiments measure how much cache hit rate and time-to-first-token improve over round-robin as the number of distinct system prompts, and so the cache pressure, grows.
+I used round-robin as the baseline because it is what a standard Kubernetes Service effectively does. All three policies run inside the same router, so measured differences come from the policy rather than from the network path. The experiments measure how much cache hit rate and time-to-first-token improve over round-robin as the number of distinct system prompts, and so the cache pressure, grows.
 
 Not tested here: more than 2 replicas, tuning the hybrid thresholds, and workloads dominated by one very popular prompt (the hotspot case the hybrid policy is designed for).
 
@@ -32,6 +36,8 @@ Not tested here: more than 2 replicas, tuning the hybrid thresholds, and workloa
 **When the set of distinct system prompts is larger than one replica's cache, cache-aware routing serves 13–16 percentage points more prompt tokens from cache than round-robin, and cuts median time to first token by 33–42%.** When every prompt fits in each replica's cache, the policies perform about the same.
 
 The workload is multi-turn chat on 2 replicas: about 0.8 new sessions per second for 2 minutes, 3 turns per session, and a ~420-token system prompt drawn from N distinct prompts. Each configuration was run 3 times. Lines show the mean, and the faint dots show the individual runs.
+
+I held think time and reply length fixed and varied the number of distinct system prompts, because that controls cache pressure directly. I capped replies at 8 tokens because CPU decoding is slow enough to swamp the prefill time that routing affects. I report hit rate as well as latency because it measures the mechanism directly, and it doesn't drift with host speed the way latency did between sessions.
 
 ![Prefix cache hit rate](results/figures/final-hit-rate.png)
 
@@ -60,7 +66,9 @@ These are means of 3 runs. The per-run ranges are in [`results/final-summary.md`
 - **Hit rate is the most stable measurement.** Repeated runs agree within 1–5 points, and an earlier single-repeat experiment (`exp3`) gave nearly the same values. Latency moved by up to 1.5–2x between sessions on the same host, so compare latencies within this table, not across experiments.
 - **The hybrid policy did not pay off here.** Its hit rate is close to cache-aware's, but its median latency was higher at 16 and 64 prompts in every run. The likely cause is that it sends a request away from its cached replica when there is a momentary load imbalance, and so pays for a full prefill. This has not been confirmed. The workload has no single dominant prompt, which is the hotspot case the hybrid policy is designed for, so this setup does not test where it should help.
 
-**Caveats:** CPU only, a 0.5B model, 2 replicas, and 3 runs per configuration. The benchmark method, including a run-order bias found and corrected along the way, is described in [`results/NOTES.md`](results/NOTES.md).
+**Caveats:** CPU only, a 0.5B model, 2 replicas, and 3 runs per configuration.
+
+**A lesson from the benchmarking:** my first experiment made the hybrid policy look much worse under heavy load. When I re-ran it with the policy order reversed, whichever policy ran last in a block was slowest, regardless of which policy it was. After that, I rotated the order and paused between runs. The full experiment log is in [`results/NOTES.md`](results/NOTES.md).
 
 ## Setup
 
@@ -93,7 +101,7 @@ The router adds an `x-routed-to` response header naming the replica that served 
 
 ### Running experiments
 
-The load generator (`loadgen/`) simulates chat users and runs inside the cluster as a Kubernetes Job. New sessions arrive at a fixed average rate (a Poisson process), regardless of how fast the system responds, so overload shows up as rising latency rather than as reduced load. Within a session, each turn waits for the previous reply and resends the whole conversation, which produces the multi-turn prefix reuse the router targets. Each run warms up every replica first, and it puts a fresh run ID into its system prompts so that prefixes cached by earlier runs can't produce hits.
+The load generator (`loadgen/`) simulates chat users and runs inside the cluster as a Kubernetes Job. I ran it in the cluster because `kubectl port-forward` hung under concurrent load. New sessions arrive at a fixed average rate (a Poisson process), regardless of how fast the system responds, so overload shows up as rising latency rather than as reduced load. Within a session, each turn waits for the previous reply and resends the whole conversation, which produces the multi-turn prefix reuse the router targets. Each run warms up every replica first, and it puts a fresh run ID into its system prompts so that prefixes cached by earlier runs can't produce hits.
 
 ```bash
 docker build -t vllm-loadgen:dev loadgen/
